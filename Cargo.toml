@@ -1,0 +1,25 @@
+[package]
+name = "volume_3d_viewer"
+version = "0.1.0"
+edition = "2024"
+description = "3D viewer for reconstructed CT volumes (folder of TIFF slices): orthogonal slice views + GPU volume rendering"
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = "1"
+colorgrad = { version = "0.8", features = ["preset"] }
+eframe = { version = "0.35", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.35"
+ndarray = "0.17"
+rayon = "1"
+rfd = "0.17"
+tiff = "0.11"
+
+[profile.release]
+opt-level = 3
