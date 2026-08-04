@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Launch the 3-D Volume Viewer GUI, rebuilding first if the sources changed.
 #
-# Usage: ./launch_3d_visualization.sh [folder_of_tiff_slices]
+# Usage: ./launch_3d_visualization.sh [folder_of_tiff_slices | multipage_tiff_file]
 #   e.g. ./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../reconstructed
+#        ./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../stack.tiff
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
