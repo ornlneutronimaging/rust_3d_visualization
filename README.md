@@ -2,8 +2,9 @@
 
 Interactive viewer for reconstructed CT volumes: point it at a folder of TIFF
 slices (e.g. the output folder written by `rust_ct_reconstruction`,
-`image_0000.tiff`, `image_0001.tiff`, …) and explore the volume as orthogonal
-slices or as a GPU-rendered 3-D volume.
+`image_0000.tiff`, `image_0001.tiff`, …) or at a single multi-page TIFF file
+(one Z-slice per page) and explore the volume as orthogonal slices or as a
+GPU-rendered 3-D volume.
 
 ## Usage
 
@@ -11,7 +12,10 @@ slices or as a GPU-rendered 3-D volume.
 # With the reconstruction output folder as argument…
 ./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../reconstructed
 
-# …or without: browse for the folder from within the application.
+# …or a single multi-page TIFF file…
+./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../stack.tiff
+
+# …or without: browse — or drag & drop a folder / TIFF file onto the window.
 ./launch_3d_visualization.sh
 ```
 
@@ -21,10 +25,11 @@ needed.
 
 ## What it does
 
-- Loads every `.tif`/`.tiff` directly inside the folder, in sorted filename
+- Loads every `.tif`/`.tiff` directly inside a folder, in sorted filename
   order along Z (files are decoded in parallel; any grayscale bit depth is
-  accepted and converted to f32). NaN/Inf voxels from the reconstruction are
-  handled gracefully.
+  accepted and converted to f32) — or all pages of a single multi-page TIFF
+  file, in page order. NaN/Inf voxels from the reconstruction are handled
+  gracefully. Inputs can also be drag & dropped onto the window.
 - **3-D volume tab** — orthographic raycasting of the volume on the GPU:
   - modes: maximum-intensity projection (MIP), alpha compositing, X-ray (mean)
   - drag to rotate, right-drag / shift-drag to pan, scroll to zoom,

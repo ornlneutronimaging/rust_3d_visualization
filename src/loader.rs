@@ -1,11 +1,13 @@
-//! Loading a folder of reconstructed TIFF slices into a 3-D volume.
+//! Loading reconstructed TIFF slices into a 3-D volume, either from a folder
+//! of single-slice files or from one multi-page TIFF stack.
 //!
-//! The expected input is the output folder of `rust_ct_reconstruction`
+//! The expected folder input is the output of `rust_ct_reconstruction`
 //! (`image_0000.tiff`, `image_0001.tiff`, … — 32-bit float grayscale), but any
 //! folder of equally-sized TIFF images works; files are stacked in sorted
-//! filename order along z. Multi-page TIFFs contribute one z-slice per page.
+//! filename order along z. Multi-page TIFFs contribute one z-slice per page,
+//! so a single file holding the whole stack also works (see [`load_file`]).
 //!
-//! Files are decoded in parallel (they usually sit on NFS/GPFS where
+//! Folder files are decoded in parallel (they usually sit on NFS/GPFS where
 //! per-file latency dominates), in chunks so peak memory stays close to one
 //! copy of the volume.
 
@@ -43,6 +45,19 @@ pub fn list_tiffs_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Load `path` into a `(nz, ny, nx)` volume: a directory is treated as a
+/// folder of TIFF slices, anything else as a single multi-page TIFF file.
+pub fn load_path(
+    path: &Path,
+    progress: impl Fn(usize, usize) + Send + Sync,
+) -> Result<Volume> {
+    if path.is_dir() {
+        load_folder(path, progress)
+    } else {
+        load_file(path, progress)
+    }
 }
 
 /// Load every TIFF in `dir` into a `(nz, ny, nx)` volume.
@@ -121,35 +136,57 @@ pub fn load_folder(
     Ok(Volume::new(data, dir.to_path_buf(), total))
 }
 
-/// Read every page of a (possibly multi-page) TIFF file.
-fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
-    use tiff::decoder::{Decoder, DecodingResult};
+/// Load a single (possibly multi-page) TIFF file into a `(nz, ny, nx)`
+/// volume, one z-slice per page in file order.
+/// `progress(pages_done, pages_total)` is called as pages are decoded.
+pub fn load_file(path: &Path, progress: impl Fn(usize, usize) + Send + Sync) -> Result<Volume> {
+    if !SUPPORTED_EXTENSIONS.contains(&ext_of(path).as_str()) {
+        bail!("{} is not a TIFF file", path.display());
+    }
 
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut decoder = Decoder::new(std::io::BufReader::new(file))
-        .with_context(|| format!("decode TIFF {}", path.display()))?;
+    // A cheap IFD walk first, so the progress bar and the up-front
+    // allocation both know the page count.
+    let total = count_pages(path)?;
 
-    let mut out = Vec::new();
+    let mut decoder = open_decoder(path)?;
+    let mut buf: Vec<f32> = Vec::new();
+    let mut dims: Option<(usize, usize)> = None; // (height, width)
+    let mut n_frames = 0usize;
+
     loop {
-        let (w, h) = decoder.dimensions()?;
-        let (w, h) = (w as usize, h as usize);
-
-        let data = decoder.read_image()?;
-        let values: Vec<f32> = match data {
-            DecodingResult::U8(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::U32(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::U64(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::I8(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::I64(v) => v.into_iter().map(|x| x as f32).collect(),
-            DecodingResult::F16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
-            DecodingResult::F32(v) => v,
-            DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
-        };
-
-        out.push(to_frame(values, w, h)?);
+        let frame = read_page(&mut decoder)
+            .with_context(|| format!("loading page {} of {}", n_frames + 1, path.display()))?;
+        let (h, w) = (frame.shape()[0], frame.shape()[1]);
+        match dims {
+            None => {
+                dims = Some((h, w));
+                let estimate = total * h * w;
+                buf.try_reserve_exact(estimate).map_err(|_| {
+                    anyhow!(
+                        "volume does not fit in memory: {} pages of {}x{} f32 = {:.1} GB",
+                        total,
+                        w,
+                        h,
+                        (estimate * 4) as f64 / 1e9
+                    )
+                })?;
+            }
+            Some((dh, dw)) if (dh, dw) != (h, w) => {
+                bail!(
+                    "Page size mismatch: {}x{} on page {} of {} does not match {}x{}",
+                    w,
+                    h,
+                    n_frames + 1,
+                    path.display(),
+                    dw,
+                    dh
+                );
+            }
+            _ => {}
+        }
+        buf.extend_from_slice(frame.as_slice().expect("frame is standard layout"));
+        n_frames += 1;
+        progress(n_frames, total);
 
         if !decoder.more_images() {
             break;
@@ -157,7 +194,67 @@ fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
         decoder.next_image()?;
     }
 
+    let (h, w) = dims.ok_or_else(|| anyhow!("No frames were loaded"))?;
+    let data = Array3::from_shape_vec((n_frames, h, w), buf)?;
+    Ok(Volume::new(data, path.to_path_buf(), 1))
+}
+
+fn open_decoder(path: &Path) -> Result<tiff::decoder::Decoder<std::io::BufReader<std::fs::File>>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    tiff::decoder::Decoder::new(std::io::BufReader::new(file))
+        .with_context(|| format!("decode TIFF {}", path.display()))
+}
+
+/// Number of pages (IFDs) in a TIFF file, without decoding any pixel data.
+fn count_pages(path: &Path) -> Result<usize> {
+    let mut decoder = open_decoder(path)?;
+    let mut n = 1usize;
+    while decoder.more_images() {
+        decoder.next_image()?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Read every page of a (possibly multi-page) TIFF file.
+fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
+    let mut decoder = open_decoder(path)?;
+    let mut out = Vec::new();
+    loop {
+        out.push(read_page(&mut decoder)?);
+        if !decoder.more_images() {
+            break;
+        }
+        decoder.next_image()?;
+    }
     Ok(out)
+}
+
+/// Decode the current page of `decoder` into an `(h, w)` f32 frame.
+fn read_page<R: std::io::Read + std::io::Seek>(
+    decoder: &mut tiff::decoder::Decoder<R>,
+) -> Result<Array2<f32>> {
+    use tiff::decoder::DecodingResult;
+
+    let (w, h) = decoder.dimensions()?;
+    let (w, h) = (w as usize, h as usize);
+
+    let data = decoder.read_image()?;
+    let values: Vec<f32> = match data {
+        DecodingResult::U8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::F16(v) => v.into_iter().map(|x| x.to_f32()).collect(),
+        DecodingResult::F32(v) => v,
+        DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
+    };
+
+    to_frame(values, w, h)
 }
 
 /// Turn a flat, row-major buffer into an `(h, w)` array. If the buffer carries
@@ -207,5 +304,34 @@ mod tests {
         assert_eq!(vol.data[[0, 0, 0]], 0.0);
         assert_eq!(vol.data[[2, 0, 0]], 200.0);
         assert_eq!(vol.data[[1, 1, 2]], 105.0);
+    }
+
+    #[test]
+    fn multipage_tiff_loads_as_volume() {
+        let dir = std::env::temp_dir().join("volume_3d_viewer_multipage_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stack.tiff");
+
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc =
+                tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+            for z in 0..4usize {
+                let data: Vec<f32> = (0..6).map(|i| (z * 100 + i) as f32).collect();
+                enc.write_image::<tiff::encoder::colortype::Gray32Float>(3, 2, &data)
+                    .unwrap();
+            }
+        }
+
+        let last = std::sync::Mutex::new((0usize, 0usize));
+        let vol = load_path(&path, |done, total| {
+            *last.lock().unwrap() = (done, total);
+        })
+        .unwrap();
+        assert_eq!(vol.data.dim(), (4, 2, 3));
+        assert_eq!(vol.data[[0, 0, 0]], 0.0);
+        assert_eq!(vol.data[[3, 1, 2]], 305.0);
+        assert_eq!(*last.lock().unwrap(), (4, 4));
     }
 }

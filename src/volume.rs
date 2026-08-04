@@ -16,6 +16,8 @@ pub struct Volume {
     /// Robust display range (0.5 % / 99.5 % percentiles, sampled).
     pub p_low: f32,
     pub p_high: f32,
+    /// Where the volume came from: a folder of TIFF slices or a single
+    /// multi-page TIFF file.
     pub folder: PathBuf,
     pub n_files: usize,
 }

@@ -77,7 +77,8 @@ impl ViewerApp {
             volume: None,
             loading: None,
             ds_job: None,
-            status: "Browse for a folder of reconstructed TIFF slices.".to_owned(),
+            status: "Browse or drop a folder of TIFF slices, or a multi-page TIFF file."
+                .to_owned(),
             cmap: Colormap::Gray,
             wmin: 0.0,
             wmax: 1.0,
@@ -102,14 +103,16 @@ impl ViewerApp {
 
     // ----- loading ----------------------------------------------------------
 
-    pub fn start_load(&mut self, dir: PathBuf, ctx: &egui::Context) {
+    /// Start loading `path` — a folder of TIFF slices or a single
+    /// (multi-page) TIFF file — on a background thread.
+    pub fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
-        let dir2 = dir.clone();
+        let path2 = path.clone();
         std::thread::spawn(move || {
             let progress_tx = Mutex::new(tx.clone());
             let ctx3 = ctx2.clone();
-            let result = loader::load_folder(&dir2, move |done, total| {
+            let result = loader::load_path(&path2, move |done, total| {
                 let _ = progress_tx.lock().unwrap().send(LoadMsg::Progress(done, total));
                 ctx3.request_repaint();
             });
@@ -117,7 +120,7 @@ impl ViewerApp {
             ctx2.request_repaint();
         });
         self.loading = Some(LoadJob { rx, done: 0, total: 0 });
-        self.status = format!("Loading {}…", dir.display());
+        self.status = format!("Loading {}…", path.display());
     }
 
     fn poll_load(&mut self, ctx: &egui::Context) {
@@ -206,6 +209,60 @@ impl ViewerApp {
         }
     }
 
+    fn browse_file(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Select a multi-page TIFF file")
+            .add_filter("TIFF", loader::SUPPORTED_EXTENSIONS);
+        if let Some(vol) = &self.volume {
+            if let Some(parent) = vol.folder.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        if let Some(file) = dialog.pick_file() {
+            self.start_load(file, ctx);
+        }
+    }
+
+    /// Dim the window while TIFFs are dragged over it and start a load when
+    /// a folder or TIFF file is dropped.
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            let rect = ctx.content_rect();
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(160));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop a multi-page TIFF file or a folder of TIFF slices",
+                egui::FontId::proportional(22.0),
+                Color32::WHITE,
+            );
+        }
+
+        let dropped: Option<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        let Some(path) = dropped else { return };
+        if self.loading.is_some() {
+            return;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if path.is_dir() || loader::SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+            self.start_load(path, ctx);
+        } else {
+            self.status = format!(
+                "Cannot load {}: not a TIFF file or a folder",
+                path.display()
+            );
+        }
+    }
+
     fn reset_view(&mut self) {
         self.rot = initial_rotation();
         self.zoom = 1.5;
@@ -227,6 +284,9 @@ impl ViewerApp {
         ));
         if ui.button("📂 Browse folder…").clicked() {
             self.browse(ctx);
+        }
+        if ui.button("🗄 Open TIFF file…").clicked() {
+            self.browse_file(ctx);
         }
 
         ui.separator();
@@ -542,7 +602,7 @@ impl ViewerApp {
                         .desired_width(420.0)
                         .show_percentage(),
                 );
-                ui.label(format!("{} / {} files", job.done, job.total));
+                ui.label(format!("{} / {} images", job.done, job.total));
             }
         });
     }
@@ -553,6 +613,7 @@ impl ViewerApp {
             ui.heading("VENUS 3-D Volume Viewer");
             ui.add_space(6.0);
             ui.label("Visualize a reconstructed CT volume from a folder of TIFF slices");
+            ui.label("or from a single multi-page TIFF file");
             ui.label(RichText::new("(e.g. the output folder of rust_ct_reconstruction)").weak());
             ui.add_space(16.0);
             if ui
@@ -561,6 +622,18 @@ impl ViewerApp {
             {
                 self.browse(ctx);
             }
+            ui.add_space(8.0);
+            if ui
+                .button(RichText::new("  🗄 Browse for a TIFF file…  ").size(16.0))
+                .clicked()
+            {
+                self.browse_file(ctx);
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new("…or drag & drop a folder or TIFF file anywhere in this window")
+                    .weak(),
+            );
         });
     }
 }
@@ -641,6 +714,7 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_load(&ctx);
         self.poll_downsample();
+        self.handle_drag_and_drop(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
