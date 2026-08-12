@@ -724,6 +724,8 @@ impl eframe::App for ViewerApp {
                     ui.selectable_value(&mut self.tab, Tab::View3D, "3-D volume");
                     ui.selectable_value(&mut self.tab, Tab::Slices, "Slices");
                 }
+                ui.separator();
+                crate::theme::toggle_button(ui);
             });
         });
 
