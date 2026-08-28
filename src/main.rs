@@ -81,6 +81,7 @@ fn main() -> eframe::Result<()> {
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(volume_3d_viewer::theme::load());
+            cc.egui_ctx.set_zoom_factor(volume_3d_viewer::zoom::load());
             let mut app = ViewerApp::new();
             if let Some(path) = input {
                 app.start_load(path, &cc.egui_ctx);
