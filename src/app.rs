@@ -513,6 +513,20 @@ impl ViewerApp {
 
     fn ui_slices(&mut self, ui: &mut egui::Ui) {
         let Some(vol) = self.volume.clone() else { return };
+        // The slice images adapt to the window, but the sliders, the readout
+        // lines and the images' minimum height can outgrow a short window
+        // (small displays, the large-text mode). The panel height is measured
+        // before entering the scroll area — inside it the available height is
+        // unbounded — and the minimum image height below is what makes the
+        // scroll bar appear.
+        let panel_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("slices_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.ui_slices_content(ui, &vol, panel_h));
+    }
+
+    fn ui_slices_content(&mut self, ui: &mut egui::Ui, vol: &Arc<Volume>, panel_h: f32) {
         let n_per_view = [vol.nz(), vol.ny(), vol.nx()];
         let lut = self.cmap.lut();
 
@@ -549,7 +563,12 @@ impl ViewerApp {
 
                 if let Some(tex) = &self.slice_tex[view] {
                     let img_size = tex.size_vec2();
-                    let avail = ui.available_size() - egui::vec2(0.0, 30.0);
+                    // 30.0 keeps room for the readout line under the image.
+                    let avail = egui::vec2(
+                        ui.available_width(),
+                        (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y - 30.0)
+                            .max(120.0),
+                    );
                     let scale = (avail.x / img_size.x)
                         .min(avail.y / img_size.y)
                         .clamp(0.001, 20.0);
