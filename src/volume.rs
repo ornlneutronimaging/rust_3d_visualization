@@ -2,6 +2,7 @@
 //! from it: intensity statistics for auto-contrast and mean-pooled
 //! downsampling to a size that fits in a GPU 3-D texture.
 
+use detector_orientation::{Orientation, Selection};
 use ndarray::Array3;
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -20,6 +21,13 @@ pub struct Volume {
     /// multi-page TIFF file.
     pub folder: PathBuf,
     pub n_files: usize,
+    /// Detector the slices were recorded with (automatic guess + user
+    /// override), which decides [`Volume::orientation`]. Reconstructed
+    /// slices normally live outside any `images/<detector>` folder and are
+    /// shown as-is.
+    pub detector: Selection,
+    /// How every slice was re-oriented on load relative to the file on disk.
+    pub orientation: Orientation,
 }
 
 /// Mean-pooled volume ready to be uploaded as a GL 3-D texture:
@@ -31,7 +39,7 @@ pub struct TextureData {
 }
 
 impl Volume {
-    pub fn new(data: Array3<f32>, folder: PathBuf, n_files: usize) -> Self {
+    pub fn new(data: Array3<f32>, folder: PathBuf, n_files: usize, detector: Selection) -> Self {
         let (vmin, vmax, p_low, p_high) = compute_stats(&data);
         Self {
             data,
@@ -41,6 +49,8 @@ impl Volume {
             p_high,
             folder,
             n_files,
+            detector,
+            orientation: detector.orientation(),
         }
     }
 
@@ -160,7 +170,7 @@ mod tests {
     fn downsample_dims_and_mean() {
         // 4x4x4 volume of constant 2.0, downsampled to <= 2 per axis.
         let data = Array3::<f32>::from_elem((4, 4, 4), 2.0);
-        let vol = Volume::new(data, PathBuf::new(), 4);
+        let vol = Volume::new(data, PathBuf::new(), 4, Selection::default());
         let td = vol.downsample_for_texture(2);
         assert_eq!(td.dims, [2, 2, 2]);
         assert!(td.data.iter().all(|v| (*v - 2.0).abs() < 1e-6));
@@ -170,7 +180,7 @@ mod tests {
     fn downsample_ignores_nan() {
         let mut data = Array3::<f32>::from_elem((2, 2, 2), 3.0);
         data[[0, 0, 0]] = f32::NAN;
-        let vol = Volume::new(data, PathBuf::new(), 2);
+        let vol = Volume::new(data, PathBuf::new(), 2, Selection::default());
         let td = vol.downsample_for_texture(1);
         assert_eq!(td.dims, [1, 1, 1]);
         assert!((td.data[0] - 3.0).abs() < 1e-6);
@@ -179,7 +189,7 @@ mod tests {
     #[test]
     fn stats_span_the_data() {
         let data = Array3::<f32>::from_shape_fn((8, 8, 8), |(z, y, x)| (z + y + x) as f32);
-        let vol = Volume::new(data, PathBuf::new(), 8);
+        let vol = Volume::new(data, PathBuf::new(), 8, Selection::default());
         assert_eq!(vol.vmin, 0.0);
         assert_eq!(vol.vmax, 21.0);
         assert!(vol.p_low <= vol.p_high);

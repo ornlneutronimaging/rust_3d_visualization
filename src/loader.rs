@@ -10,9 +10,15 @@
 //! Folder files are decoded in parallel (they usually sit on NFS/GPFS where
 //! per-file latency dominates), in chunks so peak memory stays close to one
 //! copy of the volume.
+//!
+//! Every slice is put in the sample orientation of the detector it came from
+//! (see [`detector_orientation`]: Timepix transposed, CCD flipped
+//! vertically); reconstructed slices outside an `images/<detector>` folder
+//! are loaded as-is.
 
 use crate::volume::Volume;
 use anyhow::{Context, Result, anyhow, bail};
+pub use detector_orientation::{Detector, Orientation, Selection, Source};
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -49,14 +55,16 @@ pub fn list_tiffs_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Load `path` into a `(nz, ny, nx)` volume: a directory is treated as a
 /// folder of TIFF slices, anything else as a single multi-page TIFF file.
+/// `detector` decides how every slice is oriented.
 pub fn load_path(
     path: &Path,
+    detector: Selection,
     progress: impl Fn(usize, usize) + Send + Sync,
 ) -> Result<Volume> {
     if path.is_dir() {
-        load_folder(path, progress)
+        load_folder(path, detector, progress)
     } else {
-        load_file(path, progress)
+        load_file(path, detector, progress)
     }
 }
 
@@ -64,8 +72,10 @@ pub fn load_path(
 /// `progress(files_done, files_total)` is called from worker threads.
 pub fn load_folder(
     dir: &Path,
+    detector: Selection,
     progress: impl Fn(usize, usize) + Send + Sync,
 ) -> Result<Volume> {
+    let orientation = detector.orientation();
     let paths = list_tiffs_in_dir(dir)?;
     let total = paths.len();
     let counter = AtomicUsize::new(0);
@@ -79,7 +89,7 @@ pub fn load_folder(
             .par_iter()
             .enumerate()
             .map(|(i, path)| {
-                let r = load_tiff(path);
+                let r = load_tiff(path, orientation);
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 progress(done, total);
                 (i, r)
@@ -133,16 +143,21 @@ pub fn load_folder(
 
     let (h, w) = dims.ok_or_else(|| anyhow!("No frames were loaded"))?;
     let data = Array3::from_shape_vec((n_frames, h, w), buf)?;
-    Ok(Volume::new(data, dir.to_path_buf(), total))
+    Ok(Volume::new(data, dir.to_path_buf(), total, detector))
 }
 
 /// Load a single (possibly multi-page) TIFF file into a `(nz, ny, nx)`
 /// volume, one z-slice per page in file order.
 /// `progress(pages_done, pages_total)` is called as pages are decoded.
-pub fn load_file(path: &Path, progress: impl Fn(usize, usize) + Send + Sync) -> Result<Volume> {
+pub fn load_file(
+    path: &Path,
+    detector: Selection,
+    progress: impl Fn(usize, usize) + Send + Sync,
+) -> Result<Volume> {
     if !SUPPORTED_EXTENSIONS.contains(&ext_of(path).as_str()) {
         bail!("{} is not a TIFF file", path.display());
     }
+    let orientation = detector.orientation();
 
     // A cheap IFD walk first, so the progress bar and the up-front
     // allocation both know the page count.
@@ -154,7 +169,7 @@ pub fn load_file(path: &Path, progress: impl Fn(usize, usize) + Send + Sync) -> 
     let mut n_frames = 0usize;
 
     loop {
-        let frame = read_page(&mut decoder)
+        let frame = read_page(&mut decoder, orientation)
             .with_context(|| format!("loading page {} of {}", n_frames + 1, path.display()))?;
         let (h, w) = (frame.shape()[0], frame.shape()[1]);
         match dims {
@@ -196,7 +211,7 @@ pub fn load_file(path: &Path, progress: impl Fn(usize, usize) + Send + Sync) -> 
 
     let (h, w) = dims.ok_or_else(|| anyhow!("No frames were loaded"))?;
     let data = Array3::from_shape_vec((n_frames, h, w), buf)?;
-    Ok(Volume::new(data, path.to_path_buf(), 1))
+    Ok(Volume::new(data, path.to_path_buf(), 1, detector))
 }
 
 fn open_decoder(path: &Path) -> Result<tiff::decoder::Decoder<std::io::BufReader<std::fs::File>>> {
@@ -217,11 +232,11 @@ fn count_pages(path: &Path) -> Result<usize> {
 }
 
 /// Read every page of a (possibly multi-page) TIFF file.
-fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
+fn load_tiff(path: &Path, orientation: Orientation) -> Result<Vec<Array2<f32>>> {
     let mut decoder = open_decoder(path)?;
     let mut out = Vec::new();
     loop {
-        out.push(read_page(&mut decoder)?);
+        out.push(read_page(&mut decoder, orientation)?);
         if !decoder.more_images() {
             break;
         }
@@ -230,9 +245,10 @@ fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
     Ok(out)
 }
 
-/// Decode the current page of `decoder` into an `(h, w)` f32 frame.
+/// Decode the current page of `decoder` into an oriented f32 frame.
 fn read_page<R: std::io::Read + std::io::Seek>(
     decoder: &mut tiff::decoder::Decoder<R>,
+    orientation: Orientation,
 ) -> Result<Array2<f32>> {
     use tiff::decoder::DecodingResult;
 
@@ -254,20 +270,21 @@ fn read_page<R: std::io::Read + std::io::Seek>(
         DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
     };
 
-    to_frame(values, w, h)
+    to_frame(values, w, h, orientation)
 }
 
-/// Turn a flat, row-major buffer into an `(h, w)` array. If the buffer carries
-/// several samples per pixel (e.g. RGB TIFF) only the first sample is kept.
-fn to_frame(values: Vec<f32>, w: usize, h: usize) -> Result<Array2<f32>> {
+/// Turn a flat, row-major buffer into an `(h, w)` array and re-orient it for
+/// the detector. If the buffer carries several samples per pixel (e.g. RGB
+/// TIFF) only the first sample is kept.
+fn to_frame(values: Vec<f32>, w: usize, h: usize, orientation: Orientation) -> Result<Array2<f32>> {
     let expected = w * h;
     if values.len() == expected {
-        return Ok(Array2::from_shape_vec((h, w), values)?);
+        return Ok(orientation.apply(Array2::from_shape_vec((h, w), values)?));
     }
     if expected > 0 && values.len() % expected == 0 {
         let spp = values.len() / expected;
         let first: Vec<f32> = (0..expected).map(|i| values[i * spp]).collect();
-        return Ok(Array2::from_shape_vec((h, w), first)?);
+        return Ok(orientation.apply(Array2::from_shape_vec((h, w), first)?));
     }
     bail!(
         "Pixel count {} is not compatible with {}x{}",
@@ -299,11 +316,27 @@ mod tests {
             write_f32_tiff(&dir.join(format!("image_{z:04}.tiff")), 3, 2, &data);
         }
 
-        let vol = load_folder(&dir, |_, _| {}).unwrap();
+        let vol = load_folder(&dir, Selection::default(), |_, _| {}).unwrap();
+        assert_eq!(vol.orientation, Orientation::Identity);
         assert_eq!(vol.data.dim(), (3, 2, 3));
         assert_eq!(vol.data[[0, 0, 0]], 0.0);
         assert_eq!(vol.data[[2, 0, 0]], 200.0);
         assert_eq!(vol.data[[1, 1, 2]], 105.0);
+
+        // Timepix: every slice transposed, (nz, ny, nx) = (3, 3, 2)
+        let tpx = Selection { manual: Some(Detector::Timepix), ..Default::default() };
+        let vol = load_folder(&dir, tpx, |_, _| {}).unwrap();
+        assert_eq!(vol.orientation, Orientation::Transpose);
+        assert_eq!(vol.data.dim(), (3, 3, 2));
+        assert_eq!(vol.data[[1, 2, 1]], 105.0);
+
+        // CCD: rows reversed, same shape
+        let ccd = Selection { manual: Some(Detector::Ccd), ..Default::default() };
+        let vol = load_folder(&dir, ccd, |_, _| {}).unwrap();
+        assert_eq!(vol.orientation, Orientation::FlipVertical);
+        assert_eq!(vol.data.dim(), (3, 2, 3));
+        assert_eq!(vol.data[[1, 0, 2]], 105.0);
+        assert_eq!(vol.data[[1, 1, 0]], 100.0);
     }
 
     #[test]
@@ -325,7 +358,7 @@ mod tests {
         }
 
         let last = std::sync::Mutex::new((0usize, 0usize));
-        let vol = load_path(&path, |done, total| {
+        let vol = load_path(&path, Selection::default(), |done, total| {
             *last.lock().unwrap() = (done, total);
         })
         .unwrap();

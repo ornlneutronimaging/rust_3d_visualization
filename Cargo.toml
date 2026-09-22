@@ -5,6 +5,8 @@ edition = "2024"
 description = "3D viewer for reconstructed CT volumes (folder of TIFF slices): orthogonal slice views + GPU volume rendering"
 
 [dependencies]
+# Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
+detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
 bytemuck = "1"
 colorgrad = { version = "0.8", features = ["preset"] }

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use volume_3d_viewer::app::ViewerApp;
-use volume_3d_viewer::loader;
+use volume_3d_viewer::loader::{self, Detector};
 
 const USAGE: &str = "\
 volume_3d_viewer — 3-D viewer for reconstructed CT volumes
@@ -22,16 +22,31 @@ ARGS:
          application.
 
 OPTIONS:
-  -h, --help   Show this help
+  --detector <NAME>   Force the detector the slices are loaded as, which
+                      decides their orientation: timepix (slices transposed),
+                      ccd (flipped vertically), qhy (as-is, not decided yet)
+                      or as-is. By default the detector is recognized from
+                      the folder layout (images/tpx1, images/ikonxl, …) and
+                      reconstructed slices outside those folders are shown
+                      as-is; the side panel has a combobox to change it
+  -h, --help          Show this help
 ";
 
-fn parse_args() -> Result<Option<PathBuf>, String> {
+fn parse_args() -> Result<(Option<PathBuf>, Option<Detector>), String> {
     let mut input = None;
-    for a in std::env::args().skip(1) {
+    let mut detector = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
+            }
+            "--detector" => {
+                let v = args.next().ok_or("--detector requires timepix, ccd, qhy or as-is")?;
+                detector = Some(Detector::parse(&v).ok_or_else(|| {
+                    format!("invalid --detector '{v}': expected timepix, ccd, qhy or as-is")
+                })?);
             }
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
             _ => {
@@ -42,11 +57,11 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
             }
         }
     }
-    Ok(input)
+    Ok((input, detector))
 }
 
 fn main() -> eframe::Result<()> {
-    let input = match parse_args() {
+    let (input, detector) = match parse_args() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}\n\n{USAGE}");
@@ -78,15 +93,31 @@ fn main() -> eframe::Result<()> {
         "VENUS 3-D Volume Viewer",
         native_options,
         Box::new(move |cc| {
+            install_fonts(&cc.egui_ctx);
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(volume_3d_viewer::theme::load());
             cc.egui_ctx.set_zoom_factor(volume_3d_viewer::zoom::load());
             let mut app = ViewerApp::new();
+            app.set_detector_override(detector);
             if let Some(path) = input {
                 app.start_load(path, &cc.egui_ctx);
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+/// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph
+/// for the arrows (→ ← ↑ ↓), bullets and similar symbols used in the labels,
+/// which then show up as squares; the bundled monospace font Hack has them,
+/// so it is appended as the last fallback of the proportional family.
+fn install_fonts(ctx: &eframe::egui::Context) {
+    let mut fonts = eframe::egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&eframe::egui::FontFamily::Proportional) {
+        if !family.iter().any(|f| f == "Hack") {
+            family.push("Hack".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }

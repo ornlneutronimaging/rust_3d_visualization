@@ -2,12 +2,12 @@
 //! views (axial / coronal / sagittal) and an interactive 3-D rendering tab.
 
 use crate::colormap::Colormap;
-use crate::loader;
+use crate::loader::{self, Detector, Selection};
 use crate::render3d::{self, Mat3, RenderMode, RendererState};
 use crate::volume::{TextureData, Volume};
 use anyhow::Result;
 use egui::{Color32, RichText, Sense, Stroke, TextureHandle, TextureOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +38,12 @@ pub struct ViewerApp {
     loading: Option<LoadJob>,
     ds_job: Option<Receiver<TextureData>>,
     status: String,
+    /// Path of the last load, so a detector change can reload it.
+    last_path: Option<PathBuf>,
+    /// Detector chosen by the user (side-panel combobox / `--detector`),
+    /// which decides how the slices are oriented on load; `None` = guess it
+    /// from the folder layout (`images/tpx1`, `images/ikonxl`, …).
+    detector_override: Option<Detector>,
 
     // Display settings shared by all views.
     cmap: Colormap,
@@ -79,6 +85,8 @@ impl ViewerApp {
             ds_job: None,
             status: "Browse or drop a folder of TIFF slices, or a multi-page TIFF file."
                 .to_owned(),
+            last_path: None,
+            detector_override: None,
             cmap: Colormap::Gray,
             wmin: 0.0,
             wmax: 1.0,
@@ -103,16 +111,89 @@ impl ViewerApp {
 
     // ----- loading ----------------------------------------------------------
 
+    /// Force the detector (hence the orientation) the slices are loaded
+    /// with, `None` to go back to the automatic guess (the `--detector`
+    /// command-line option).
+    pub fn set_detector_override(&mut self, detector: Option<Detector>) {
+        self.detector_override = detector;
+    }
+
+    /// Detector to load `path` with: the user's override, else the folder
+    /// layout.
+    fn detector_for(&self, path: &Path) -> Selection {
+        let mut sel = Selection::from_path(path);
+        sel.manual = self.detector_override;
+        sel
+    }
+
+    /// Side-panel combobox choosing the detector (hence the orientation on
+    /// load): "auto" follows the folder layout, the other entries force one.
+    /// Changing it reloads the volume.
+    fn detector_combo(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label("Detector:").on_hover_text(
+                "How the slices are oriented on load: Timepix → transposed, CCD → flipped \
+                 vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector \
+                 from the folder layout (images/tpx1, images/ikonxl, …); reconstructed \
+                 slices outside those folders are shown as-is.",
+            );
+            let auto_text = match self.volume.as_ref() {
+                Some(v) if v.detector.is_auto() => format!("auto: {}", v.detector.summary()),
+                _ => "auto".to_owned(),
+            };
+            let current = match self.detector_override {
+                None => auto_text.clone(),
+                Some(d) => d.label().to_owned(),
+            };
+            let mut changed = false;
+            egui::ComboBox::from_id_salt("detector")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.detector_override.is_none(), auto_text)
+                        .on_hover_text("Guess the detector from the folder layout")
+                        .clicked()
+                        && self.detector_override.is_some()
+                    {
+                        self.detector_override = None;
+                        changed = true;
+                    }
+                    for d in Detector::ALL {
+                        if ui
+                            .selectable_label(self.detector_override == Some(d), d.label())
+                            .on_hover_text(d.description())
+                            .clicked()
+                            && self.detector_override != Some(d)
+                        {
+                            self.detector_override = Some(d);
+                            changed = true;
+                        }
+                    }
+                });
+            if let Some(v) = self.volume.as_ref() {
+                ui.label(RichText::new(v.orientation.label()).weak())
+                    .on_hover_text(v.detector.detector().description());
+            }
+            if changed && self.loading.is_none()
+                && let Some(path) = self.last_path.clone()
+            {
+                self.start_load(path, ctx);
+            }
+        });
+    }
+
     /// Start loading `path` — a folder of TIFF slices or a single
     /// (multi-page) TIFF file — on a background thread.
     pub fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let detector = self.detector_for(&path);
+        self.last_path = Some(path.clone());
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         let path2 = path.clone();
         std::thread::spawn(move || {
             let progress_tx = Mutex::new(tx.clone());
             let ctx3 = ctx2.clone();
-            let result = loader::load_path(&path2, move |done, total| {
+            let result = loader::load_path(&path2, detector, move |done, total| {
                 let _ = progress_tx.lock().unwrap().send(LoadMsg::Progress(done, total));
                 ctx3.request_repaint();
             });
@@ -164,11 +245,13 @@ impl ViewerApp {
         }
         self.tex_dims = None;
         self.status = format!(
-            "Loaded {} slices of {}x{} from {}",
+            "Loaded {} slices of {}x{} from {} — {}: {}",
             vol.nz(),
             vol.nx(),
             vol.ny(),
-            vol.folder.display()
+            vol.folder.display(),
+            vol.detector.summary(),
+            vol.orientation.label()
         );
         self.volume = Some(vol);
         self.spawn_downsample(ctx);
@@ -288,6 +371,7 @@ impl ViewerApp {
         if ui.button("🗄 Open TIFF file…").clicked() {
             self.browse_file(ctx);
         }
+        self.detector_combo(ui, ctx);
 
         ui.separator();
         ui.heading("Display");

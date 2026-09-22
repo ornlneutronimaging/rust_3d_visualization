@@ -753,6 +753,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "detector_orientation"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3334,6 +3341,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "colorgrad",
+ "detector_orientation",
  "eframe",
  "egui",
  "ndarray",
