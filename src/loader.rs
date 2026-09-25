@@ -330,13 +330,13 @@ mod tests {
         assert_eq!(vol.data.dim(), (3, 3, 2));
         assert_eq!(vol.data[[1, 2, 1]], 105.0);
 
-        // CCD: rows reversed, same shape
+        // CCD: rows and columns reversed (180°), same shape
         let ccd = Selection { manual: Some(Detector::Ccd), ..Default::default() };
         let vol = load_folder(&dir, ccd, |_, _| {}).unwrap();
-        assert_eq!(vol.orientation, Orientation::FlipVertical);
+        assert_eq!(vol.orientation, Orientation::Rotate180);
         assert_eq!(vol.data.dim(), (3, 2, 3));
-        assert_eq!(vol.data[[1, 0, 2]], 105.0);
-        assert_eq!(vol.data[[1, 1, 0]], 100.0);
+        assert_eq!(vol.data[[1, 0, 0]], 105.0);
+        assert_eq!(vol.data[[1, 1, 2]], 100.0);
     }
 
     #[test]

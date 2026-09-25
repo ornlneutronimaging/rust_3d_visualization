@@ -133,7 +133,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.label("Detector:").on_hover_text(
                 "How the slices are oriented on load: Timepix → transposed, CCD → flipped \
-                 vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector \
+                 vertically, QHY → rotated 90° counterclockwise. 'auto' recognizes the detector \
                  from the folder layout (images/tpx1, images/ikonxl, …); reconstructed \
                  slices outside those folders are shown as-is.",
             );

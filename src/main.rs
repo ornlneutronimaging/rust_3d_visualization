@@ -24,7 +24,7 @@ ARGS:
 OPTIONS:
   --detector <NAME>   Force the detector the slices are loaded as, which
                       decides their orientation: timepix (slices transposed),
-                      ccd (flipped vertically), qhy (as-is, not decided yet)
+                      ccd (flipped vertically and horizontally), qhy (rotated 90° counterclockwise)
                       or as-is. By default the detector is recognized from
                       the folder layout (images/tpx1, images/ikonxl, …) and
                       reconstructed slices outside those folders are shown
