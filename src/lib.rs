@@ -1,6 +1,7 @@
 pub mod app;
 pub mod colormap;
 pub mod loader;
+pub mod logger;
 pub mod render3d;
 pub mod theme;
 pub mod zoom;

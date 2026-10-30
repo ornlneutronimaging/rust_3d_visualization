@@ -166,6 +166,7 @@ pub fn paint(gl: &glow::Context, shared: &Arc<Mutex<RendererState>>) {
         match GlObjects::new(gl) {
             Ok(objs) => s.gl = Some(objs),
             Err(e) => {
+                crate::logger::error(format!("3-D rendering unavailable: {e}"));
                 s.error = Some(e);
                 return;
             }

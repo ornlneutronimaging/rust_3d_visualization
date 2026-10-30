@@ -48,6 +48,16 @@ The full-resolution volume is held in RAM as f32 (e.g. a 2048×2048×1500
 reconstruction is ~25 GB); peak usage during loading is about one volume plus
 a small chunk of decoded slices. Run it on an analysis node for large volumes.
 
+## Log
+
+Every session appends to `/SNS/VENUS/shared/log/3d_visualization_<user>.log`
+(same directory, naming and line format as the other VENUS tools, so the
+**log browser** shows it): the command line, every folder / TIFF file loaded
+(with its shape, detector and orientation), the display and rendering options
+changed, every load error shown in the status bar (`ERROR` lines) and any
+crash (`PANIC`). If the file cannot be opened the application still runs,
+with a warning on stderr.
+
 ## Development
 
 ```bash

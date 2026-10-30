@@ -3,6 +3,7 @@
 
 use crate::colormap::Colormap;
 use crate::loader::{self, Detector, Selection};
+use crate::logger;
 use crate::render3d::{self, Mat3, RenderMode, RendererState};
 use crate::volume::{TextureData, Volume};
 use anyhow::Result;
@@ -174,6 +175,12 @@ impl ViewerApp {
                 ui.label(RichText::new(v.orientation.label()).weak())
                     .on_hover_text(v.detector.detector().description());
             }
+            if changed {
+                logger::log(format!(
+                    "Detector set to {}",
+                    self.detector_override.map_or("auto", |d| d.label())
+                ));
+            }
             if changed && self.loading.is_none()
                 && let Some(path) = self.last_path.clone()
             {
@@ -202,6 +209,11 @@ impl ViewerApp {
         });
         self.loading = Some(LoadJob { rx, done: 0, total: 0 });
         self.status = format!("Loading {}…", path.display());
+        logger::log(format!(
+            "{} (detector: {})",
+            self.status,
+            self.detector_override.map_or("auto", |d| d.label())
+        ));
     }
 
     fn poll_load(&mut self, ctx: &egui::Context) {
@@ -221,7 +233,10 @@ impl ViewerApp {
             self.loading = None;
             match res {
                 Ok(vol) => self.apply_volume(vol, ctx),
-                Err(e) => self.status = format!("Load failed: {e:#}"),
+                Err(e) => {
+                    self.status = format!("Load failed: {e:#}");
+                    logger::error(&self.status);
+                }
             }
         }
     }
@@ -253,6 +268,10 @@ impl ViewerApp {
             vol.detector.summary(),
             vol.orientation.label()
         );
+        logger::log(format!(
+            "{} (value range {:.6} … {:.6}, auto-contrast {:.6} … {:.6})",
+            self.status, vol.vmin, vol.vmax, vol.p_low, vol.p_high
+        ));
         self.volume = Some(vol);
         self.spawn_downsample(ctx);
     }
@@ -261,6 +280,7 @@ impl ViewerApp {
         let Some(vol) = &self.volume else { return };
         let vol = Arc::clone(vol);
         let res = self.tex_res;
+        logger::log(format!("Downsampling volume to a 3-D texture of at most {res}³"));
         let ctx = ctx.clone();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -274,6 +294,8 @@ impl ViewerApp {
     fn poll_downsample(&mut self) {
         let Some(rx) = &self.ds_job else { return };
         if let Ok(td) = rx.try_recv() {
+            let [dx, dy, dz] = td.dims;
+            logger::log(format!("3-D texture ready: {dx} × {dy} × {dz}"));
             self.tex_dims = Some(td.dims);
             self.renderer.lock().unwrap().pending_volume = Some(td);
             self.ds_job = None;
@@ -287,8 +309,12 @@ impl ViewerApp {
                 dialog = dialog.set_directory(parent);
             }
         }
-        if let Some(dir) = dialog.pick_folder() {
-            self.start_load(dir, ctx);
+        match dialog.pick_folder() {
+            Some(dir) => {
+                logger::log(format!("Browse folder: picked {}", dir.display()));
+                self.start_load(dir, ctx);
+            }
+            None => logger::log("Browse folder: dialog cancelled"),
         }
     }
 
@@ -301,8 +327,12 @@ impl ViewerApp {
                 dialog = dialog.set_directory(parent);
             }
         }
-        if let Some(file) = dialog.pick_file() {
-            self.start_load(file, ctx);
+        match dialog.pick_file() {
+            Some(file) => {
+                logger::log(format!("Open TIFF file: picked {}", file.display()));
+                self.start_load(file, ctx);
+            }
+            None => logger::log("Open TIFF file: dialog cancelled"),
         }
     }
 
@@ -329,8 +359,13 @@ impl ViewerApp {
             ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         let Some(path) = dropped else { return };
         if self.loading.is_some() {
+            logger::warn(format!(
+                "Dropped {} ignored: a load is still running",
+                path.display()
+            ));
             return;
         }
+        logger::log(format!("Dropped: {}", path.display()));
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -343,6 +378,7 @@ impl ViewerApp {
                 "Cannot load {}: not a TIFF file or a folder",
                 path.display()
             );
+            logger::error(&self.status);
         }
     }
 
@@ -385,6 +421,7 @@ impl ViewerApp {
                 }
             });
         if before != self.cmap {
+            logger::log(format!("Colormap: {}", self.cmap.label()));
             self.renderer.lock().unwrap().pending_cmap = Some(self.cmap.lut());
         }
 
@@ -406,18 +443,24 @@ impl ViewerApp {
             if ui.button("Auto contrast").clicked() {
                 self.wmin = vol.p_low;
                 self.wmax = vol.p_high.max(vol.p_low + 1e-30);
+                logger::log(format!("Auto contrast: display range {:.6} … {:.6}", self.wmin, self.wmax));
             }
             if ui.button("Full range").clicked() {
                 self.wmin = vmin;
                 self.wmax = vmax;
+                logger::log(format!("Full range: display range {:.6} … {:.6}", self.wmin, self.wmax));
             }
         });
 
         ui.separator();
         ui.heading("3-D rendering");
 
+        let before_mode = self.mode;
         for m in RenderMode::ALL {
             ui.radio_value(&mut self.mode, m, m.label());
+        }
+        if before_mode != self.mode {
+            logger::log(format!("Render mode: {}", self.mode.label()));
         }
         ui.add(egui::Slider::new(&mut self.steps, 64..=768).text("Quality (ray steps)"));
         ui.add_enabled(
@@ -436,6 +479,7 @@ impl ViewerApp {
                 }
             });
         if before_res != self.tex_res {
+            logger::log(format!("3-D texture size: ≤ {}³", self.tex_res));
             self.spawn_downsample(ctx);
         }
         match (&self.ds_job, self.tex_dims) {
@@ -467,12 +511,14 @@ impl ViewerApp {
                     }
                 }
                 if ui.button("Reset clip").clicked() {
+                    logger::log("Reset clip box");
                     self.clip_min = [0.0; 3];
                     self.clip_max = [1.0; 3];
                 }
             });
 
         if ui.button("Reset view").clicked() {
+            logger::log("Reset view");
             self.reset_view();
         }
     }
@@ -824,8 +870,15 @@ impl eframe::App for ViewerApp {
                 ui.heading("VENUS 3-D Volume Viewer");
                 if self.volume.is_some() {
                     ui.separator();
+                    let before = self.tab;
                     ui.selectable_value(&mut self.tab, Tab::View3D, "3-D volume");
                     ui.selectable_value(&mut self.tab, Tab::Slices, "Slices");
+                    if before != self.tab {
+                        logger::log(match self.tab {
+                            Tab::View3D => "Tab: 3-D volume",
+                            Tab::Slices => "Tab: Slices",
+                        });
+                    }
                 }
                 ui.separator();
                 crate::theme::toggle_button(ui);

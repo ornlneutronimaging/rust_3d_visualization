@@ -8,6 +8,7 @@ description = "3D viewer for reconstructed CT volumes (folder of TIFF slices): o
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
 detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
+chrono = "0.4"
 bytemuck = "1"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = { version = "0.35", default-features = false, features = [

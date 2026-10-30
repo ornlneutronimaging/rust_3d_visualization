@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use volume_3d_viewer::app::ViewerApp;
 use volume_3d_viewer::loader::{self, Detector};
+use volume_3d_viewer::logger;
 
 const USAGE: &str = "\
 volume_3d_viewer — 3-D viewer for reconstructed CT volumes
@@ -39,6 +40,7 @@ fn parse_args() -> Result<(Option<PathBuf>, Option<Detector>), String> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
+                logger::log("--help requested, exiting");
                 println!("{USAGE}");
                 std::process::exit(0);
             }
@@ -61,22 +63,50 @@ fn parse_args() -> Result<(Option<PathBuf>, Option<Detector>), String> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Shared VENUS log (3d_visualization_<user>.log), so what a user did and
+    // where it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: volume_3d_viewer {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+
     let (input, detector) = match parse_args() {
         Ok(f) => f,
         Err(e) => {
+            logger::error(format!("Invalid command line: {e}"));
             eprintln!("Error: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
     };
+    if let Some(d) = detector {
+        logger::log(format!("Detector forced from the command line: {}", d.label()));
+    }
 
     // Surface obvious input errors on stderr before the GUI opens.
     if let Some(path) = &input {
         if path.is_dir() {
             if let Err(e) = loader::list_tiffs_in_dir(path) {
+                logger::error(format!("Invalid input folder {}: {e:#}", path.display()));
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         } else if !path.is_file() {
+            logger::error(format!("Input {} does not exist", path.display()));
             eprintln!("Error: {} does not exist", path.display());
             std::process::exit(1);
         }
@@ -89,7 +119,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "VENUS 3-D Volume Viewer",
         native_options,
         Box::new(move |cc| {
@@ -105,7 +135,12 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }
 
 /// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph
