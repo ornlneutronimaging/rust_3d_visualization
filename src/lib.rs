@@ -1,5 +1,6 @@
 pub mod app;
 pub mod colormap;
+pub mod hyper;
 pub mod loader;
 pub mod logger;
 pub mod render3d;

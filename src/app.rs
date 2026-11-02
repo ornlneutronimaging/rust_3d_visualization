@@ -2,6 +2,7 @@
 //! views (axial / coronal / sagittal) and an interactive 3-D rendering tab.
 
 use crate::colormap::Colormap;
+use crate::hyper::{self, HyperSet};
 use crate::loader::{self, Detector, Selection};
 use crate::logger;
 use crate::render3d::{self, Mat3, RenderMode, RendererState};
@@ -26,13 +27,23 @@ const SLICE_NAMES: [&str; 3] = ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"];
 enum LoadMsg {
     Progress(usize, usize),
     Done(Result<Volume>),
+    /// A rehydrated hyperspectral file: the component volumes and the
+    /// basis, from which the TOF volumes are computed.
+    DoneHyper(Result<HyperSet>),
 }
 
 struct LoadJob {
     rx: Receiver<LoadMsg>,
     done: usize,
     total: usize,
+    /// Whether the load is a rehydrated file (the progress counts its
+    /// component volumes, not slices).
+    hyper: bool,
 }
+
+/// A TOF selection on a rehydrated file: the first bin and the number of
+/// bins averaged.
+type TofRange = (usize, usize);
 
 pub struct ViewerApp {
     volume: Option<Arc<Volume>>,
@@ -45,6 +56,16 @@ pub struct ViewerApp {
     /// which decides how the slices are oriented on load; `None` = guess it
     /// from the folder layout (`images/tpx1`, `images/ikonxl`, …).
     detector_override: Option<Detector>,
+
+    // The rehydrated hyperspectral data set the volume comes from, when
+    // it does: the TOF range shown, the one being computed, the one asked
+    // for while that computation ran.
+    hyper: Option<Arc<HyperSet>>,
+    tof_bin: usize,
+    tof_width: usize,
+    tof_shown: Option<TofRange>,
+    tof_job: Option<(TofRange, Receiver<Volume>)>,
+    tof_pending: Option<TofRange>,
 
     // Display settings shared by all views.
     cmap: Colormap,
@@ -88,6 +109,12 @@ impl ViewerApp {
                 .to_owned(),
             last_path: None,
             detector_override: None,
+            hyper: None,
+            tof_bin: 0,
+            tof_width: 1,
+            tof_shown: None,
+            tof_job: None,
+            tof_pending: None,
             cmap: Colormap::Gray,
             wmin: 0.0,
             wmax: 1.0,
@@ -192,6 +219,10 @@ impl ViewerApp {
     /// Start loading `path` — a folder of TIFF slices or a single
     /// (multi-page) TIFF file — on a background thread.
     pub fn start_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if hyper::is_hyper_file(&path) {
+            self.start_load_hyper(path, ctx);
+            return;
+        }
         let detector = self.detector_for(&path);
         self.last_path = Some(path.clone());
         let (tx, rx) = channel();
@@ -207,13 +238,123 @@ impl ViewerApp {
             let _ = tx.send(LoadMsg::Done(result));
             ctx2.request_repaint();
         });
-        self.loading = Some(LoadJob { rx, done: 0, total: 0 });
+        self.loading = Some(LoadJob { rx, done: 0, total: 0, hyper: false });
         self.status = format!("Loading {}…", path.display());
         logger::log(format!(
             "{} (detector: {})",
             self.status,
             self.detector_override.map_or("auto", |d| d.label())
         ));
+    }
+
+    /// Start loading a rehydrated hyperspectral file (the component
+    /// volumes and the basis) on a background thread; the volume of the
+    /// middle TOF bin is shown first.
+    fn start_load_hyper(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.last_path = Some(path.clone());
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        let path2 = path.clone();
+        std::thread::spawn(move || {
+            let progress_tx = Mutex::new(tx.clone());
+            let ctx3 = ctx2.clone();
+            let result = HyperSet::load(&path2, move |done, total| {
+                let _ = progress_tx.lock().unwrap().send(LoadMsg::Progress(done, total));
+                ctx3.request_repaint();
+            });
+            let _ = tx.send(LoadMsg::DoneHyper(result));
+            ctx2.request_repaint();
+        });
+        self.loading = Some(LoadJob { rx, done: 0, total: 0, hyper: true });
+        self.status = format!("Loading the rehydrated file {}…", path.display());
+        logger::log(&self.status);
+    }
+
+    /// The rehydrated file is in: show the volume of its middle TOF bin.
+    fn apply_hyper(&mut self, set: HyperSet, ctx: &egui::Context) {
+        logger::log(format!(
+            "Rehydrated file loaded: {} components, {} TOF bins, volumes of {} × {} × {} (X × Y × Z){}",
+            set.n_components,
+            set.bins,
+            set.shape[2],
+            set.shape[1],
+            set.shape[0],
+            if set.tof_s.is_some() { ", TOF axis present" } else { ", no TOF axis" }
+        ));
+        self.volume = None;
+        self.tex_dims = None;
+        self.renderer.lock().unwrap().has_volume = false;
+        self.tof_bin = set.bins / 2;
+        self.tof_width = 1;
+        self.tof_shown = None;
+        self.tof_job = None;
+        self.tof_pending = None;
+        self.hyper = Some(Arc::new(set));
+        self.request_tof_volume(ctx);
+    }
+
+    /// Compute the volume of the TOF range selected, on a background
+    /// thread — or note it for when the computation in flight is done.
+    fn request_tof_volume(&mut self, ctx: &egui::Context) {
+        let Some(set) = &self.hyper else { return };
+        let (first, last) = set.bin_range(self.tof_bin, self.tof_width);
+        let range = (first, last - first);
+        if self.tof_shown == Some(range) && self.tof_job.is_none() {
+            return;
+        }
+        if let Some((running, _)) = &self.tof_job {
+            if *running != range {
+                self.tof_pending = Some(range);
+            }
+            return;
+        }
+        self.tof_pending = None;
+        let set = Arc::clone(set);
+        let ctx = ctx.clone();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(set.volume(range.0, range.1));
+            ctx.request_repaint();
+        });
+        self.tof_job = Some((range, rx));
+    }
+
+    fn poll_tof_volume(&mut self, ctx: &egui::Context) {
+        let Some((range, rx)) = &self.tof_job else { return };
+        let range = *range;
+        let Ok(vol) = rx.try_recv() else { return };
+        self.tof_job = None;
+        self.tof_shown = Some(range);
+        if self.volume.is_none() {
+            // The first volume of the file: the window and the views are
+            // set from it.
+            self.apply_volume(vol, ctx);
+        } else {
+            // Another TOF bin of the same data set: keep the window, the
+            // slices and the camera, so the bins compare.
+            self.status = self.hyper_status(&vol);
+            self.volume = Some(Arc::new(vol));
+            self.slice_key = [None; 3];
+            self.spawn_downsample(ctx);
+        }
+        if self.tof_pending.take().is_some() {
+            self.request_tof_volume(ctx);
+        }
+    }
+
+    fn hyper_status(&self, vol: &Volume) -> String {
+        match &self.hyper {
+            Some(set) => format!(
+                "{} — TOF {} — volume of {}x{}x{} (X × Y × Z), {} components",
+                set.path.display(),
+                set.range_label(self.tof_bin, self.tof_width),
+                vol.nx(),
+                vol.ny(),
+                vol.nz(),
+                set.n_components
+            ),
+            None => String::new(),
+        }
     }
 
     fn poll_load(&mut self, ctx: &egui::Context) {
@@ -225,15 +366,22 @@ impl ViewerApp {
                         job.done = done;
                         job.total = total;
                     }
-                    LoadMsg::Done(res) => result = Some(res),
+                    LoadMsg::Done(res) => result = Some(Ok(res)),
+                    LoadMsg::DoneHyper(res) => result = Some(Err(res)),
                 }
             }
         }
         if let Some(res) = result {
             self.loading = None;
             match res {
-                Ok(vol) => self.apply_volume(vol, ctx),
-                Err(e) => {
+                Ok(Ok(vol)) => {
+                    self.hyper = None;
+                    self.tof_shown = None;
+                    self.tof_job = None;
+                    self.apply_volume(vol, ctx);
+                }
+                Err(Ok(set)) => self.apply_hyper(set, ctx),
+                Ok(Err(e)) | Err(Err(e)) => {
                     self.status = format!("Load failed: {e:#}");
                     logger::error(&self.status);
                 }
@@ -259,15 +407,19 @@ impl ViewerApp {
             r.has_volume = false;
         }
         self.tex_dims = None;
-        self.status = format!(
-            "Loaded {} slices of {}x{} from {} — {}: {}",
-            vol.nz(),
-            vol.nx(),
-            vol.ny(),
-            vol.folder.display(),
-            vol.detector.summary(),
-            vol.orientation.label()
-        );
+        self.status = if self.hyper.is_some() {
+            self.hyper_status(&vol)
+        } else {
+            format!(
+                "Loaded {} slices of {}x{} from {} — {}: {}",
+                vol.nz(),
+                vol.nx(),
+                vol.ny(),
+                vol.folder.display(),
+                vol.detector.summary(),
+                vol.orientation.label()
+            )
+        };
         logger::log(format!(
             "{} (value range {:.6} … {:.6}, auto-contrast {:.6} … {:.6})",
             self.status, vol.vmin, vol.vmax, vol.p_low, vol.p_high
@@ -336,6 +488,24 @@ impl ViewerApp {
         }
     }
 
+    fn browse_hyper(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Select a rehydrated hyperspectral file (NeCTAR)")
+            .add_filter("HDF5", hyper::EXTENSIONS);
+        if let Some(vol) = &self.volume {
+            if let Some(parent) = vol.folder.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        match dialog.pick_file() {
+            Some(file) => {
+                logger::log(format!("Open rehydrated file: picked {}", file.display()));
+                self.start_load(file, ctx);
+            }
+            None => logger::log("Open rehydrated file: dialog cancelled"),
+        }
+    }
+
     /// Dim the window while TIFFs are dragged over it and start a load when
     /// a folder or TIFF file is dropped.
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
@@ -349,7 +519,7 @@ impl ViewerApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop a multi-page TIFF file or a folder of TIFF slices",
+                "Drop a folder of TIFF slices, a multi-page TIFF file or a rehydrated .h5 file",
                 egui::FontId::proportional(22.0),
                 Color32::WHITE,
             );
@@ -371,11 +541,14 @@ impl ViewerApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        if path.is_dir() || loader::SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+        if path.is_dir()
+            || loader::SUPPORTED_EXTENSIONS.contains(&ext.as_str())
+            || hyper::EXTENSIONS.contains(&ext.as_str())
+        {
             self.start_load(path, ctx);
         } else {
             self.status = format!(
-                "Cannot load {}: not a TIFF file or a folder",
+                "Cannot load {}: not a TIFF file, a folder or a rehydrated .h5 file",
                 path.display()
             );
             logger::error(&self.status);
@@ -401,13 +574,89 @@ impl ViewerApp {
             vol.ny(),
             vol.nz()
         ));
+        if let Some(set) = self.hyper.clone() {
+            ui.label(
+                RichText::new(format!(
+                    "4-D: {} TOF bins, {} components{}",
+                    set.bins,
+                    set.n_components,
+                    if set.dataset_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", set.dataset_name)
+                    }
+                ))
+                .small()
+                .weak(),
+            );
+        }
         if ui.button("📂 Browse folder…").clicked() {
             self.browse(ctx);
         }
         if ui.button("🗄 Open TIFF file…").clicked() {
             self.browse_file(ctx);
         }
-        self.detector_combo(ui, ctx);
+        if ui
+            .button("🧊 Open rehydrated file…")
+            .on_hover_text("a 4-D hyperspectral CT (one volume per TOF bin) written by NeCTAR's rehydration")
+            .clicked()
+        {
+            self.browse_hyper(ctx);
+        }
+        if self.hyper.is_none() {
+            self.detector_combo(ui, ctx);
+        }
+
+        if let Some(set) = self.hyper.clone() {
+            ui.separator();
+            ui.heading("TOF");
+            ui.label(
+                RichText::new(
+                    "the volume shown is the attenuation at this TOF bin — or the mean over \
+                     several bins, which is less noisy: Σ components × basis",
+                )
+                .small()
+                .weak(),
+            );
+            let last_bin = set.bins.saturating_sub(1);
+            let mut changed = false;
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.tof_bin, 0..=last_bin)
+                        .text("bin")
+                        .smart_aim(false),
+                )
+                .changed();
+            ui.horizontal(|ui| {
+                ui.label("bins averaged");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.tof_width)
+                            .range(1..=set.bins.max(1))
+                            .speed(0.2),
+                    )
+                    .on_hover_text("the mean of this many bins from the one selected")
+                    .changed();
+                if ui.small_button("◀").on_hover_text("previous bin(s)").clicked() {
+                    self.tof_bin = self.tof_bin.saturating_sub(self.tof_width.max(1));
+                    changed = true;
+                }
+                if ui.small_button("▶").on_hover_text("next bin(s)").clicked() {
+                    self.tof_bin = (self.tof_bin + self.tof_width.max(1)).min(last_bin);
+                    changed = true;
+                }
+            });
+            ui.label(RichText::new(set.range_label(self.tof_bin, self.tof_width)).small());
+            if changed {
+                self.request_tof_volume(ctx);
+            }
+            if self.tof_job.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("computing the volume…").small().weak());
+                });
+            }
+        }
 
         ui.separator();
         ui.heading("Display");
@@ -720,7 +969,13 @@ impl ViewerApp {
                             _ => (idx, px, py),
                         };
                         let v = vol.data[[z, y, x]];
-                        self.slice_readout[view] = format!("x={x}  y={y}  z={z}   value={v:.6}");
+                        self.slice_readout[view] = match &self.hyper {
+                            Some(set) => format!(
+                                "x={x}  y={y}  z={z}   value={v:.6}   ({})",
+                                set.range_label(self.tof_bin, self.tof_width)
+                            ),
+                            None => format!("x={x}  y={y}  z={z}   value={v:.6}"),
+                        };
                     }
                     ui.monospace(&self.slice_readout[view]);
                 }
@@ -738,6 +993,20 @@ impl ViewerApp {
                 ui.heading("Building volume & statistics…");
                 ui.add_space(10.0);
                 ui.spinner();
+            } else if job.hyper {
+                ui.heading("Loading the component volumes of the rehydrated file…");
+                ui.add_space(10.0);
+                let frac = if job.total > 0 {
+                    job.done as f32 / job.total as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(420.0)
+                        .show_percentage(),
+                );
+                ui.label(format!("{} / {} components", job.done, job.total));
             } else {
                 ui.heading("Loading reconstructed slices…");
                 ui.add_space(10.0);
@@ -761,8 +1030,9 @@ impl ViewerApp {
             ui.add_space(ui.available_height() * 0.35);
             ui.heading("VENUS 3-D Volume Viewer");
             ui.add_space(6.0);
-            ui.label("Visualize a reconstructed CT volume from a folder of TIFF slices");
-            ui.label("or from a single multi-page TIFF file");
+            ui.label("Visualize a reconstructed CT volume from a folder of TIFF slices,");
+            ui.label("from a single multi-page TIFF file, or a 4-D hyperspectral CT");
+            ui.label("(a rehydrated .h5 file written by NeCTAR: one volume per TOF bin)");
             ui.label(RichText::new("(e.g. the output folder of rust_ct_reconstruction)").weak());
             ui.add_space(16.0);
             if ui
@@ -778,10 +1048,20 @@ impl ViewerApp {
             {
                 self.browse_file(ctx);
             }
+            ui.add_space(8.0);
+            if ui
+                .button(RichText::new("  🧊 Browse for a rehydrated file…  ").size(16.0))
+                .clicked()
+            {
+                self.browse_hyper(ctx);
+            }
             ui.add_space(16.0);
             ui.label(
-                RichText::new("…or drag & drop a folder or TIFF file anywhere in this window")
-                    .weak(),
+                RichText::new(
+                    "…or drag & drop a folder, a TIFF file or a rehydrated .h5 file anywhere in \
+                     this window",
+                )
+                .weak(),
             );
         });
     }
@@ -862,6 +1142,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_load(&ctx);
+        self.poll_tof_volume(&ctx);
         self.poll_downsample();
         self.handle_drag_and_drop(&ctx);
 
@@ -904,6 +1185,13 @@ impl eframe::App for ViewerApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.loading.is_some() {
                 self.ui_loading(ui);
+            } else if self.volume.is_none() && self.tof_job.is_some() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.35);
+                    ui.heading("Computing the volume of the TOF bin…");
+                    ui.add_space(10.0);
+                    ui.spinner();
+                });
             } else if self.volume.is_none() {
                 self.ui_welcome(ui, &ctx);
             } else {

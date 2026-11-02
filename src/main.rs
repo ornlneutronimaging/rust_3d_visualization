@@ -1,7 +1,8 @@
 //! 3-D Volume Viewer — visualize a reconstructed CT volume (a folder of TIFF
 //! slices, e.g. the output of `rust_ct_reconstruction`, or a single
 //! multi-page TIFF file) as orthogonal slices and an interactive GPU-rendered
-//! 3-D volume.
+//! 3-D volume — or a 4-D hyperspectral CT (a rehydrated `.h5` file written
+//! by NeCTAR, one volume per TOF bin) with a TOF slider.
 
 use std::path::PathBuf;
 use volume_3d_viewer::app::ViewerApp;
@@ -18,9 +19,11 @@ ARGS:
   PATH   Either a folder containing the reconstructed slices as TIFF files,
          e.g. the output folder written by rust_ct_reconstruction
          (image_0000.tiff, image_0001.tiff, … — stacked in sorted filename
-         order along Z), or a single multi-page TIFF file (one Z-slice per
-         page). When omitted, browse or drag & drop from within the
-         application.
+         order along Z), a single multi-page TIFF file (one Z-slice per
+         page), or a rehydrated hyperspectral file (.h5, written by
+         NeCTAR's rehydration: one CT volume per TOF bin — a TOF slider in
+         the side panel picks the volume shown). When omitted, browse or
+         drag & drop from within the application.
 
 OPTIONS:
   --detector <NAME>   Force the detector the slices are loaded as, which

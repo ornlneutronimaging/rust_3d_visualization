@@ -2,7 +2,7 @@
 name = "volume_3d_viewer"
 version = "0.1.0"
 edition = "2024"
-description = "3D viewer for reconstructed CT volumes (folder of TIFF slices): orthogonal slice views + GPU volume rendering"
+description = "3D viewer for reconstructed CT volumes (folder of TIFF slices, or a rehydrated hyperspectral file with a TOF slider): orthogonal slice views + GPU volume rendering"
 
 [dependencies]
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
@@ -20,6 +20,11 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 ndarray = "0.17"
+# Rehydrated hyperspectral files (NeCTAR): the component volumes and the
+# basis, combined on the fly per TOF bin. ndarray 0.16 is what hdf5-metno
+# 0.10 hands back from its slice reads.
+hdf5-metno = "0.10"
+ndarray16 = { package = "ndarray", version = "0.16" }
 rayon = "1"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 tiff = "0.11"

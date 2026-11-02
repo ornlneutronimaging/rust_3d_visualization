@@ -4,7 +4,9 @@ Interactive viewer for reconstructed CT volumes: point it at a folder of TIFF
 slices (e.g. the output folder written by `rust_ct_reconstruction`,
 `image_0000.tiff`, `image_0001.tiff`, …) or at a single multi-page TIFF file
 (one Z-slice per page) and explore the volume as orthogonal slices or as a
-GPU-rendered 3-D volume.
+GPU-rendered 3-D volume. It also opens a 4-D hyperspectral CT — a rehydrated
+`.h5` file written by NeCTAR's rehydration, one CT volume per TOF bin — with
+a TOF slider that picks the volume shown.
 
 ## Usage
 
@@ -15,7 +17,10 @@ GPU-rendered 3-D volume.
 # …or a single multi-page TIFF file…
 ./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../stack.tiff
 
-# …or without: browse — or drag & drop a folder / TIFF file onto the window.
+# …or a rehydrated hyperspectral file (4-D: one volume per TOF bin)…
+./launch_3d_visualization.sh /SNS/VENUS/IPTS-XXXXX/shared/.../<data set>_rehydrated.h5
+
+# …or without: browse — or drag & drop a folder / TIFF / .h5 file onto the window.
 ./launch_3d_visualization.sh
 ```
 
@@ -39,6 +44,18 @@ needed.
     (default ≤ 256³) so arbitrarily large volumes render smoothly
 - **Slices tab** — full-resolution axial (Z), coronal (Y) and sagittal (X)
   slices with a slider each and a cursor value readout.
+- **Rehydrated hyperspectral files** (`.h5`, NeCTAR's rehydration): the
+  file holds the reconstructed volume of every subspace component of the
+  dehydration (`component_volumes`, (components, z, y, x)) and the basis
+  spectra (`subspace_basis`, (components, TOF bins)); the attenuation
+  volume of a TOF bin is Σ components × basis, computed on the fly — a
+  handful of volumes in memory, never the full 4-D array. The side panel
+  gets a **TOF** block: a bin slider (the TOF in ms when the file has the
+  axis), **bins averaged** (the mean over several bins, less noisy) and
+  ◀ ▶ steps; the display range, the slice positions and the camera are
+  kept from one bin to the next, so the bins compare. The slice readout
+  names the bin shown. The detector combobox does not apply (the volumes
+  are shown as reconstructed).
 - Shared display settings: colormap (Gray, Viridis, Inferno, …, Jet) and
   min/max display range with auto-contrast (0.5–99.5 percentiles).
 
